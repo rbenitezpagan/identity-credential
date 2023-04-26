@@ -19,15 +19,34 @@ package com.android.identity.mdoc.response;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import com.android.identity.credential.Credential;
+import com.android.identity.credential.CredentialRequest;
+import com.android.identity.keystore.KeystoreEngine;
+import com.android.identity.credential.NameSpacedData;
 import com.android.identity.util.Constants;
 import com.android.identity.internal.Util;
+import com.android.identity.util.Logger;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.PublicKey;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
 
 import co.nstant.in.cbor.CborBuilder;
 import co.nstant.in.cbor.builder.ArrayBuilder;
 import co.nstant.in.cbor.builder.MapBuilder;
+import co.nstant.in.cbor.model.ByteString;
 import co.nstant.in.cbor.model.DataItem;
+import co.nstant.in.cbor.model.SimpleValue;
+import co.nstant.in.cbor.model.SimpleValueType;
 import co.nstant.in.cbor.model.UnicodeString;
 
 /**
@@ -35,7 +54,7 @@ import co.nstant.in.cbor.model.UnicodeString;
  * as specified in <em>ISO/IEC 18013-5</em> section 8.3 <em>Device Retrieval</em>.
  */
 public final class DeviceResponseGenerator {
-
+    private static final String TAG = "DeviceResponseGenerator";
     private final ArrayBuilder<CborBuilder> mDocumentsBuilder;
     @Constants.DeviceResponseStatus private final long mStatusCode;
 
@@ -168,6 +187,325 @@ public final class DeviceResponseGenerator {
         }
         mDocumentsBuilder.add(builder.build().get(0));
         return this;
+    }
+
+    private static class DecodedStaticAuthData {
+        private DecodedStaticAuthData(@NonNull Map<String, List<byte[]>> digestIdMapping,
+                                      @NonNull byte[] encodedIssuerAuth) {
+            this.digestIdMapping = digestIdMapping;
+            this.encodedIssuerAuth = encodedIssuerAuth;
+        }
+        Map<String, List<byte[]>> digestIdMapping;
+        byte[] encodedIssuerAuth;
+    }
+
+    // TODO: Replace with StaticAuthDataParser once Issue 284 is resolved.
+    private static @NonNull
+    DecodedStaticAuthData
+    decodeStaticAuthData(@NonNull byte[] staticAuthData) {
+        DataItem topMapItem = Util.cborDecode(staticAuthData);
+        if (!(topMapItem instanceof co.nstant.in.cbor.model.Map)) {
+            throw new IllegalArgumentException("Top-level is not a map");
+        }
+        co.nstant.in.cbor.model.Map topMap = (co.nstant.in.cbor.model.Map) topMapItem;
+        DataItem issuerAuthItem = topMap.get(new UnicodeString("issuerAuth"));
+        if (issuerAuthItem == null) {
+            throw new IllegalArgumentException("issuerAuth item does not exist");
+        }
+        byte[] encodedIssuerAuth = Util.cborEncode(issuerAuthItem);
+
+        Map<String, List<byte[]>> buildOuterMap = new HashMap<>();
+
+        DataItem outerMapItem = topMap.get(new UnicodeString("digestIdMapping"));
+        if (!(outerMapItem instanceof co.nstant.in.cbor.model.Map)) {
+            throw new IllegalArgumentException(
+                    "digestIdMapping value is not a map or does not exist");
+        }
+        co.nstant.in.cbor.model.Map outerMap = (co.nstant.in.cbor.model.Map) outerMapItem;
+        for (DataItem outerKey : outerMap.getKeys()) {
+            if (!(outerKey instanceof UnicodeString)) {
+                throw new IllegalArgumentException("Outer key is not a string");
+            }
+            String ns = ((UnicodeString) outerKey).getString();
+
+            List<byte[]> buildInnerArray = new ArrayList<>();
+            buildOuterMap.put(ns, buildInnerArray);
+
+            DataItem outerValue = outerMap.get(outerKey);
+            if (!(outerValue instanceof co.nstant.in.cbor.model.Array)) {
+                throw new IllegalArgumentException("Outer value is not an array");
+            }
+            co.nstant.in.cbor.model.Array innerArray = (co.nstant.in.cbor.model.Array) outerValue;
+            for (DataItem innerKey : innerArray.getDataItems()) {
+                if (!(innerKey instanceof ByteString)) {
+                    throw new IllegalArgumentException("Inner key is not a bstr");
+                }
+                if (innerKey.getTag().getValue() != 24) {
+                    throw new IllegalArgumentException("Inner key does not have tag 24");
+                }
+                byte[] encodedIssuerSignedItemBytes = ((ByteString) innerKey).getBytes();
+
+                // Strictly not necessary but check that elementValue is NULL. This is to
+                // avoid applications (or issuers) sending the value in issuerSignedMapping
+                // which is part of staticAuthData. This would be bad because then the
+                // data element value would be available without any access control checks.
+                //
+                DataItem issuerSignedItem = Util.cborExtractTaggedAndEncodedCbor(innerKey);
+                DataItem value = Util.cborMapExtract(issuerSignedItem, "elementValue");
+                if (!(value instanceof SimpleValue)
+                        || ((SimpleValue) value).getSimpleValueType() != SimpleValueType.NULL) {
+                    String name = Util.cborMapExtractString(issuerSignedItem, "elementIdentifier");
+                    throw new IllegalArgumentException("elementValue for nameSpace " + ns
+                            + " elementName " + name + " is not NULL");
+                }
+
+                buildInnerArray.add(
+                        Util.cborEncode(Util.cborBuildTaggedByteString(encodedIssuerSignedItemBytes)));
+            }
+        }
+        return new DecodedStaticAuthData(buildOuterMap, encodedIssuerAuth);
+    }
+
+    private static @NonNull
+    Map<String, Map<String, byte[]>> calcIssuerSignedItemMap(
+            @NonNull  Map<String, List<byte[]>> issuerNameSpaces) {
+        Map<String, Map<String, byte[]>> ret = new LinkedHashMap<>();
+        for (String nameSpaceName : issuerNameSpaces.keySet()) {
+            Map<String, byte[]> innerMap = new LinkedHashMap<>();
+            for (byte[] encodedIssuerSignedItemBytes : issuerNameSpaces.get(nameSpaceName)) {
+                byte[] encodedIssuerSignedItem = Util.cborExtractTaggedCbor(encodedIssuerSignedItemBytes);
+                DataItem map = Util.cborDecode(encodedIssuerSignedItem);
+                String elementIdentifier = Util.cborMapExtractString(map, "elementIdentifier");
+                innerMap.put(elementIdentifier, encodedIssuerSignedItem);
+            }
+            ret.put(nameSpaceName, innerMap);
+        }
+        return ret;
+    }
+
+    private static @Nullable
+    byte[] lookupIssuerSignedMap(@NonNull Map<String, Map<String, byte[]>> issuerSignedMap,
+                                 @NonNull String nameSpaceName,
+                                 @NonNull String dataElementName) {
+        Map<String, byte[]> innerMap = issuerSignedMap.get(nameSpaceName);
+        if (innerMap == null) {
+            return null;
+        }
+        return innerMap.get(dataElementName);
+    }
+
+    private @NonNull
+    DeviceResponseGenerator addDocumentResponse(
+            @NonNull CredentialRequest request,
+            @NonNull Credential credential,
+            @NonNull String docType,
+            @NonNull byte[] encodedSessionTranscript,
+            @Nullable NameSpacedData deviceSignedData,
+            @NonNull Credential.AuthenticationKey authenticationKey,
+            @Nullable KeystoreEngine.KeyUnlockData keyUnlockData,
+            @KeystoreEngine.Algorithm int signatureAlgorithm,
+            @NonNull PublicKey eReaderKey)
+            throws KeystoreEngine.KeyLockedException {
+
+        DecodedStaticAuthData decodedStaticAuthData = decodeStaticAuthData(
+                authenticationKey.getIssuerProvidedData());
+
+        Map<String, Map<String, byte[]>> issuerSignedItemMap =
+                calcIssuerSignedItemMap(decodedStaticAuthData.digestIdMapping);
+
+        NameSpacedData credentialData = credential.getNameSpacedData();
+
+        Map<String, List<byte[]>> issuerSignedData = new LinkedHashMap<>();
+        for (CredentialRequest.DataElement element : request.getRequestedDataElements()) {
+            if (element.getIgnored()) {
+                continue;
+            }
+            String nameSpaceName = element.getNameSpaceName();
+            String dataElementName = element.getDataElementName();
+            if (!credentialData.hasDataElement(nameSpaceName, dataElementName)) {
+                Logger.w(TAG, "No data element in credential for nameSpace "
+                        + nameSpaceName + " dataElementName " + dataElementName);
+                continue;
+            }
+            byte[] value = credentialData.getDataElement(nameSpaceName, dataElementName);
+
+            byte[] encodedIssuerSignedItemWithoutValue =
+                    lookupIssuerSignedMap(issuerSignedItemMap, nameSpaceName, dataElementName);
+            if (encodedIssuerSignedItemWithoutValue == null) {
+                Logger.w(TAG, "No IssuerSignedItem for " + nameSpaceName + " " + dataElementName);
+                continue;
+            }
+
+            byte[] encodedIssuerSignedItem = Util.issuerSignedItemSetValue(encodedIssuerSignedItemWithoutValue, value);
+
+            List<byte[]> list = issuerSignedData.computeIfAbsent(element.getNameSpaceName(), k -> new ArrayList<>());
+            list.add(encodedIssuerSignedItem);
+        }
+
+        CborBuilder deviceNameSpacesBuilder = new CborBuilder();
+        MapBuilder<CborBuilder> mapBuilder = deviceNameSpacesBuilder.addMap();
+        if (deviceSignedData != null) {
+            for (String nameSpaceName : deviceSignedData.getNameSpaceNames()) {
+                MapBuilder<MapBuilder<CborBuilder>> nsBuilder = mapBuilder.putMap(nameSpaceName);
+                for (String dataElementName : deviceSignedData.getDataElementNames(nameSpaceName)) {
+                    nsBuilder.put(
+                            new UnicodeString(dataElementName),
+                            Util.cborDecode(deviceSignedData.getDataElement(nameSpaceName, dataElementName)));
+                }
+            }
+        }
+        mapBuilder.end();
+        byte[] encodedDeviceNameSpaces = Util.cborEncode(deviceNameSpacesBuilder.build().get(0));
+
+        byte[] deviceAuthentication = Util.cborEncode(new CborBuilder()
+                .addArray()
+                .add("DeviceAuthentication")
+                .add(Util.cborDecode(encodedSessionTranscript))
+                .add(docType)
+                .add(Util.cborBuildTaggedByteString(encodedDeviceNameSpaces))
+                .end()
+                .build().get(0));
+
+        byte[] deviceAuthenticationBytes =
+                Util.cborEncode(Util.cborBuildTaggedByteString(deviceAuthentication));
+
+        byte[] encodedDeviceSignature = null;
+        byte[] encodedDeviceMac = null;
+        if (signatureAlgorithm != KeystoreEngine.ALGORITHM_UNSET) {
+            encodedDeviceSignature = Util.cborEncode(Util.coseSign1Sign(
+                    authenticationKey.getKeystoreEngine(),
+                    authenticationKey.getAlias(),
+                    signatureAlgorithm,
+                    keyUnlockData,
+                    null,
+                    deviceAuthenticationBytes,
+                    null));
+        } else {
+            byte[] sharedSecret = authenticationKey.getKeystoreEngine()
+                    .keyAgreement(authenticationKey.getAlias(),
+                            eReaderKey,
+                            keyUnlockData);
+
+            byte[] sessionTranscriptBytes =
+                    Util.cborEncode(Util.cborBuildTaggedByteString(encodedSessionTranscript));
+
+            byte[] salt;
+            try {
+                salt = MessageDigest.getInstance("SHA-256").digest(sessionTranscriptBytes);
+            } catch (NoSuchAlgorithmException e) {
+                throw new IllegalStateException("Unexpected exception", e);
+            }
+            byte[] info = "EMacKey".getBytes(StandardCharsets.UTF_8);
+            byte[] derivedKey = Util.computeHkdf("HmacSha256", sharedSecret, salt, info, 32);
+            SecretKey secretKey = new SecretKeySpec(derivedKey, "");
+
+            encodedDeviceMac = Util.cborEncode(
+                    Util.coseMac0(secretKey,
+                            new byte[0],                 // payload
+                            deviceAuthenticationBytes));  // detached content
+        }
+
+        return addDocument(docType,
+                encodedDeviceNameSpaces,
+                encodedDeviceSignature,
+                encodedDeviceMac,
+                issuerSignedData,
+                null,
+                decodedStaticAuthData.encodedIssuerAuth);
+    }
+
+    /**
+     * Adds a credential presentation to the device response being built.
+     *
+     * <p>This builds up {@code Document} CBOR as specified in ISO/IEC 18013-5
+     * section 8.3.2.1.2.2. The {@code request} parameter is used to specify
+     * the data elements to select from the given {@code credential} parameter
+     * and if present in the credential, the value will be included as an
+     * issuer-signed data element. The credential must have its issuer-provided
+     * data in a format that conforms with the CDDL defined in
+     * {@link StaticAuthData}. Device-signed data elements to include can
+     * be set in the {@code deviceSignedData} parameter
+     *
+     * <p>This uses <em>mdoc ECDSA / EdDSA Authentication</em> as defined
+     * in ISO/IEC 18013-5 section 9.1.3.6. To use <em>mdoc MAC Authentication</em>
+     * authentication, see
+     * {@link #addDocumentResponseWithMdocMacAuthentication(CredentialRequest, Credential, String, byte[], NameSpacedData, Credential.AuthenticationKey, KeystoreEngine.KeyUnlockData, PublicKey)}.
+     *
+     * @param request an object describing which data elements to include in the response.
+     * @param credential the credential to use for retrieving the data elements.
+     * @param docType the document type.
+     * @param deviceSignedData data elements to include in {@code DeviceSigned} or {@code null}.
+     * @param encodedSessionTranscript the bytes of the {@code SessionTranscript} CBOR.
+     * @param authenticationKey the key to use for producing {@code DeviceAuth} CBOR.
+     * @param keyUnlockData data used for unlocking the key or {@code null} if not needed.
+     * @param signatureAlgorithm the signature algorithm to use.
+     * @return the generator.
+     * @throws KeystoreEngine.KeyLockedException if the key is locked.
+     */
+    public @NonNull
+    DeviceResponseGenerator addDocumentResponseWithMdocSignatureAuthentication(
+            @NonNull CredentialRequest request,
+            @NonNull Credential credential,
+            @NonNull String docType,
+            @NonNull byte[] encodedSessionTranscript,
+            @Nullable NameSpacedData deviceSignedData,
+            @NonNull Credential.AuthenticationKey authenticationKey,
+            @Nullable KeystoreEngine.KeyUnlockData keyUnlockData,
+            @KeystoreEngine.Algorithm int signatureAlgorithm)
+            throws KeystoreEngine.KeyLockedException {
+        return addDocumentResponse(request,
+                credential,
+                docType,
+                encodedSessionTranscript,
+                deviceSignedData,
+                authenticationKey,
+                keyUnlockData,
+                signatureAlgorithm,
+                null);
+    }
+
+    /**
+     * Adds a credential presentation to the device response being built.
+     *
+     * <p>Like<
+     * {@link #addDocumentResponseWithMdocSignatureAuthentication(CredentialRequest, Credential, String, byte[], NameSpacedData, Credential.AuthenticationKey, KeystoreEngine.KeyUnlockData, int)}
+     * but uses <em>mdoc MAC Authentication</em> as defined
+     * in ISO/IEC 18013-5 section 9.1.3.5 instead of <em>mdoc ECDSA / EdDSA Authentication</em>.
+     *
+     * <p>Note that for this to work, the passed-in {@code eReaderKey} and {@code authenticationKey}
+     * must use the same curve.
+     *
+     * @param request an object describing which data elements to include in the response.
+     * @param credential the credential to use for retrieving the data elements.
+     * @param docType the document type.
+     * @param deviceSignedData data elements to include in {@code DeviceSigned} or {@code null}.
+     * @param encodedSessionTranscript the bytes of the {@code SessionTranscript} CBOR.
+     * @param authenticationKey the key to use for producing {@code DeviceAuth} CBOR.
+     * @param keyUnlockData data used for unlocking the key or {@code null} if not needed.
+     * @param eReaderKey the ephemeral reader key.
+     * @return the generator.
+     * @throws KeystoreEngine.KeyLockedException if the key is locked.
+     */
+    public @NonNull
+    DeviceResponseGenerator addDocumentResponseWithMdocMacAuthentication(
+            @NonNull CredentialRequest request,
+            @NonNull Credential credential,
+            @NonNull String docType,
+            @NonNull byte[] encodedSessionTranscript,
+            @Nullable NameSpacedData deviceSignedData,
+            @NonNull Credential.AuthenticationKey authenticationKey,
+            @Nullable KeystoreEngine.KeyUnlockData keyUnlockData,
+            @NonNull PublicKey eReaderKey)
+            throws KeystoreEngine.KeyLockedException {
+        return addDocumentResponse(request,
+                credential,
+                docType,
+                encodedSessionTranscript,
+                deviceSignedData,
+                authenticationKey,
+                keyUnlockData,
+                KeystoreEngine.ALGORITHM_UNSET,
+                eReaderKey);
     }
 
     /**
